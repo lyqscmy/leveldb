@@ -1,0 +1,6 @@
+-DLEVELDB_PLATFORM_POSIX=1
+-Ibuild/include/
+-Iinclude/
+-I./
+-std=c++11
+-Wthread-safety
