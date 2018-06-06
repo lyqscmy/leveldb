@@ -1201,25 +1201,36 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 }
 
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
+  // writers中有三类writer
+  // 1. non null batch
+  //   1. sync batch
+  //   2. non sync batch
+  // 2. null batch
   Writer w(&mutex_);
   w.batch = my_batch;
   w.sync = options.sync;
   w.done = false;
 
-  MutexLock l(&mutex_);
+  MutexLock l(&mutex_); //一次获取
   writers_.push_back(&w);
+  // wait_queue : writers_
+  // cv锁的是w.done和writers_.front, 这两个条件可以被其他写线程修改
   while (!w.done && &w != writers_.front()) {
-    w.cv.Wait();
+    w.cv.Wait(); //一次释放和获取
   }
   if (w.done) {
+    //被唤醒后占有锁，此处由MutextLock析构函数释放锁
     return w.status;
   }
 
+  // 进入此处的是全局唯一写线程
   // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(my_batch == nullptr);
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
   if (status.ok() && my_batch != nullptr) {  // nullptr batch is for compactions
+    //到此处memtable空间是否足够本次batch？超过怎么处理？
+    //合并writer, 为什么？合并多少？
     WriteBatch* updates = BuildBatchGroup(&last_writer);
     WriteBatchInternal::SetSequence(updates, last_sequence + 1);
     last_sequence += WriteBatchInternal::Count(updates);
@@ -1230,6 +1241,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
     // into mem_.
     {
       mutex_.Unlock();
+      // 写入log
       status = log_->AddRecord(WriteBatchInternal::Contents(updates));
       bool sync_error = false;
       if (status.ok() && options.sync) {
@@ -1238,10 +1250,11 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
           sync_error = true;
         }
       }
+      // 写入log成功，写入memtable
       if (status.ok()) {
         status = WriteBatchInternal::InsertInto(updates, mem_);
       }
-      mutex_.Lock();
+      mutex_.Lock(); //再次加锁，需要互斥的更新versions的last_sequence，何处释放锁?
       if (sync_error) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
@@ -1257,11 +1270,15 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   while (true) {
     Writer* ready = writers_.front();
     writers_.pop_front();
+    //跳过leader，为何不移到while前面？
     if (ready != &w) {
+      // 此处的status是写入log或写入memtable的结果
       ready->status = status;
+      // 此处是否把跳过的writer也标记了？
       ready->done = true;
       ready->cv.Signal();
     }
+
     if (ready == last_writer) break;
   }
 
@@ -1270,6 +1287,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
     writers_.front()->cv.Signal();
   }
 
+  //这一批writer最后的锁释放
   return status;
 }
 
@@ -1287,7 +1305,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   // Allow the group to grow up to a maximum size, but if the
   // original write is small, limit the growth so we do not slow
   // down the small write too much.
-  size_t max_size = 1 << 20;
+  size_t max_size = 1 << 20; //memtable是否有足够空间？
   if (size <= (128<<10)) {
     max_size = size + (128<<10);
   }
@@ -1297,6 +1315,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   ++iter;  // Advance past "first"
   for (; iter != writers_.end(); ++iter) {
     Writer* w = *iter;
+    // sync和non-sync不能合并，group写完后清理时如何跳过这些未合并的？
     if (w->sync && !first->sync) {
       // Do not include a sync write into a batch handled by a non-sync write.
       break;
@@ -1486,7 +1505,7 @@ void DBImpl::GetApproximateSizes(
 Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
   WriteBatch batch;
   batch.Put(key, value);
-  return Write(opt, &batch);
+  return Write(opt, &batch);  //异步or同步？有哪些返回状态？
 }
 
 Status DB::Delete(const WriteOptions& opt, const Slice& key) {
